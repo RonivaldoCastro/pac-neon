@@ -2536,6 +2536,14 @@
 
 
                 <div class="flex flex-wrap items-center gap-1.5 shrink-0" onclick="event.stopPropagation()">
+                  ${!isIdle ? `
+                    <button onclick="stopAgentExecution('${agent.id}', event)"
+                            class="px-3 py-1 rounded-lg bg-[#FF1744] hover:bg-[#D50000] text-white border border-[#FF8A80] font-black transition shadow-[0_0_12px_rgba(255,23,68,0.55)]"
+                            title="Interromper / parar imediatamente a execução atual deste agente (Stop / Ctrl+C / Esc)">
+                      ⏹ PARAR
+                    </button>
+                  ` : ''}
+
                   <!-- UNIFIED JUMP TO EXECUTION WINDOW BUTTON -->
                   <button onclick="focusAgentWindow('${agent.id}', 'auto')"
                           class="px-3 py-1 rounded-lg bg-[#00E5FF]/20 hover:bg-[#00E5FF]/40 text-[#00E5FF] border border-[#00E5FF] font-black transition shadow-[0_0_10px_rgba(0,229,255,0.2)]"
@@ -2708,8 +2716,17 @@
                 <input id="direct-cmd-input" type="text"
                        oninput="handlePromptInput(this, document.getElementById('arcade-console')?.dataset.agentId || selectedAgentId, null)"
                        onkeydown="handlePromptKeyDown(event, this, document.getElementById('arcade-console')?.dataset.agentId || selectedAgentId, null)"
-                       placeholder="Digite / para abrir Skills ou qualquer comando/prompt e tecle Enter (rascunho salvo)..."
+                       placeholder="Digite / (ex: /stop para parar) ou qualquer comando/prompt e tecle Enter..."
                        class="flex-1 px-2.5 py-2 rounded-lg bg-[#01040A] border border-[#0066FF] text-white font-mono text-xs focus:outline-none focus:border-[#FFE600]" />
+                <button id="direct-cmd-stop-btn"
+                        type="button"
+                        data-keep-input-focus="true"
+                        onmousedown="event.preventDefault()"
+                        onclick="stopAgentExecution(document.getElementById('arcade-console')?.dataset.agentId || selectedAgentId, event)"
+                        class="px-3 py-2 rounded-lg bg-[#FF2E93]/20 hover:bg-[#FF1744] text-[#FF5252] hover:text-white border border-[#FF2E93]/70 font-black text-xs transition shrink-0"
+                        title="Interromper / parar imediatamente a execução do agente (Stop / Ctrl+C / Esc ou comando /stop)">
+                  ⏹ PARAR
+                </button>
                 <button id="direct-cmd-send-btn"
                         type="button"
                         data-keep-input-focus="true"
@@ -2729,6 +2746,14 @@
         termScreenAndKeysBox = document.getElementById('arcade-terminal-screen-and-keys');
         promptBarBox = document.getElementById('arcade-terminal-prompt-bar');
         footerBox = document.getElementById('arcade-console-footer');
+      }
+
+      // Dynamically highlight the persistent ⏹ PARAR button when the agent is actively executing
+      const stopBtnEl = document.getElementById('direct-cmd-stop-btn');
+      if (stopBtnEl) {
+        stopBtnEl.className = !isIdle
+          ? 'px-3 py-2 rounded-lg bg-[#FF1744] hover:bg-[#D50000] text-white border border-[#FF8A80] font-black text-xs transition shrink-0 shadow-[0_0_14px_rgba(255,23,68,0.65)] animate-pulse'
+          : 'px-3 py-2 rounded-lg bg-[#FF2E93]/20 hover:bg-[#FF1744] text-[#FF5252] hover:text-white border border-[#FF2E93]/70 font-black text-xs transition shrink-0';
       }
 
       // Include current_action, active_tool, and context/hallucination/stall telemetry in consoleSig
@@ -2808,11 +2833,20 @@
             <span class="font-black">${isIdle ? '👻 STATUS PARADO:' : '⚡ PAC-NEON EM AÇÃO:'}</span>
             <span class="ml-1 text-white font-semibold">${escapeHtml(agent.current_action || (isIdle ? 'Aguardando próximo comando' : 'Processando...'))}</span>
           </div>
-          ${!isIdle && agent.active_tool ? `
-            <span class="px-2 py-0.5 rounded bg-[#0078D9]/40 border border-[#00E5FF]/60 text-[11px] font-black text-[#00E5FF] shrink-0">
-              🛠️ ${escapeHtml(agent.active_tool)}
-            </span>
-          ` : ''}
+          <div class="flex items-center gap-1.5 shrink-0">
+            ${!isIdle && agent.active_tool ? `
+              <span class="px-2 py-0.5 rounded bg-[#0078D9]/40 border border-[#00E5FF]/60 text-[11px] font-black text-[#00E5FF]">
+                🛠️ ${escapeHtml(agent.active_tool)}
+              </span>
+            ` : ''}
+            ${!isIdle ? `
+              <button onclick="stopAgentExecution('${agent.id}', event)"
+                      class="px-2.5 py-0.5 rounded-lg bg-[#FF1744] hover:bg-[#D50000] text-white border border-[#FF8A80] text-[11px] font-black transition shadow-[0_0_10px_rgba(255,23,68,0.55)]"
+                      title="Interromper imediatamente a execução atual deste agente">
+                ⏹ PARAR
+              </button>
+            ` : ''}
+          </div>
         </div>
 
         <!-- 🧠 DIAGNÓSTICO DE CONTEXTO, ALUCINAÇÃO & LATÊNCIA -->
