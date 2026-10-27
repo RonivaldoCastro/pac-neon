@@ -1,0 +1,20 @@
+#!/bin/zsh
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+REPO_DIR="$(cd "$(dirname "$0")/../../.." 2>/dev/null && pwd)"
+if [ -d "$REPO_DIR/pac_neon" ]; then
+    export PYTHONPATH="$REPO_DIR"
+fi
+if ! curl -fsS "http://127.0.0.1:8765/api/superset/status" >/dev/null 2>&1; then
+    if command -v pac-neon >/dev/null 2>&1; then
+        pac-neon start --no-open >/dev/null 2>&1 &
+    else
+        python3 -m pac_neon.cli start --no-open >/dev/null 2>&1 &
+    fi
+    for i in {1..20}; do
+        sleep 0.15
+        if curl -fsS "http://127.0.0.1:8765/api/superset/status" >/dev/null 2>&1; then
+            break
+        fi
+    done
+fi
+open "http://127.0.0.1:8765"
