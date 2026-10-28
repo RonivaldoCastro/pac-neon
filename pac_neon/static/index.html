@@ -3067,6 +3067,11 @@
           <button onclick="quickCommand('${agent.id}', 'Esc')" class="px-2 py-0.5 rounded bg-[#0C1A3B] hover:border-[#FF2E93] border border-[#0066FF] text-rose-200 font-mono text-[11px]">
             Esc
           </button>
+          <button onclick="stopAgentExecution('${agent.id}', event)"
+                  class="px-2.5 py-0.5 rounded bg-[#FF1744]/25 hover:bg-[#FF1744] border border-[#FF1744] text-[#FF8A80] hover:text-white font-mono font-black text-[11px] transition"
+                  title="Interromper / parar imediatamente a execução atual deste agente (Stop / Ctrl+C / Esc)">
+            ⏹ Stop (Ctrl+C)
+          </button>
         </div>
       `;
 
@@ -3331,6 +3336,34 @@
       } catch (_) {}
     }
 
+    async function stopAgentExecution(agentId, ev) {
+      if (ev) ev.stopPropagation();
+      const targetId = agentId || selectedAgentId;
+      if (!targetId) return;
+      sfxAlertPellet();
+      try {
+        const res = await fetch(`${API_BASE}/api/agents/${targetId}/stop`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.state) {
+            state = data.state;
+          } else if (data.agent) {
+            const idx = state.agents.findIndex(a => a.id === targetId);
+            if (idx >= 0) state.agents[idx] = data.agent;
+          }
+          const agName = data.agent?.workspace_title || data.agent?.name || targetId;
+          const detail = data.stop_result?.detail || 'Sinal de interrupção enviado';
+          showToast(`⏹ Execução interrompida em "${agName}" (${detail})`);
+          renderAll();
+          return;
+        }
+      } catch (_) {}
+      showToast('⚠️ Falha ao enviar sinal de interrupção para o agente.');
+    }
+
     async function sendDirectCommand(agentId) {
       const input = document.getElementById('direct-cmd-input');
       if (!input || !input.value.trim()) return;
@@ -3340,6 +3373,11 @@
       if (agentId) {
         window._termUserScrolledUp[agentId] = false;
         delete window._termSavedScrollTop[agentId];
+      }
+      const cmdLow = prompt.toLowerCase();
+      if (cmdLow === '/stop' || cmdLow === '/parar' || cmdLow === '/cancel' || cmdLow === '/interrupt' || cmdLow === 'ctrl+c' || cmdLow === '^c') {
+        await stopAgentExecution(agentId);
+        return;
       }
       await quickCommand(agentId, prompt);
     }

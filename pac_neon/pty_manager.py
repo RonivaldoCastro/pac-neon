@@ -172,7 +172,7 @@ class ManagedPTYSession:
     def resolve_permission(self, action: PermissionResolutionAction, custom_text: Optional[str] = None) -> bool:
         adapter = AdapterRegistry.get(self.unit.provider)
         seq = (
-            adapter.format_approval_Sequence(action.value, custom_text)
+            adapter.format_approval_sequence(action.value, custom_text)
             if adapter
             else (custom_text + "\r" if custom_text else ("y\r" if action != PermissionResolutionAction.DENY else "n\r"))
         )

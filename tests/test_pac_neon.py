@@ -242,62 +242,62 @@ def test_hub_endpoints_and_permission_approval():
         target_id = data["agents"][0]["id"]
         original_title = data["agents"][0].get("workspace_title") or data["agents"][0]["name"]
 
-        # Test Handoff Preview endpoint
-        preview = await handoff_preview_agent(target_id)
-        assert preview["ok"] is True
-        assert "handoff_prompt" in preview
-        assert len(preview["handoff_prompt"]) > 20
+        with patch.object(srv_mod.hub, "_save_workspace_state", return_value=None):
+            # Test Handoff Preview endpoint
+            preview = await handoff_preview_agent(target_id)
+            assert preview["ok"] is True
+            assert "handoff_prompt" in preview
+            assert len(preview["handoff_prompt"]) > 20
 
-        # Test Archive to History and Restore to Active
-        arch_res = await archive_agent_endpoint(target_id, {"archived": True})
-        assert arch_res["ok"] is True
-        assert arch_res["agent"]["archived"] is True
+            # Test Archive to History and Restore to Active
+            arch_res = await archive_agent_endpoint(target_id, {"archived": True})
+            assert arch_res["ok"] is True
+            assert arch_res["agent"]["archived"] is True
 
-        unarch_res = await archive_agent_endpoint(target_id, {"archived": False})
-        assert unarch_res["ok"] is True
-        assert unarch_res["agent"]["archived"] is False
+            unarch_res = await archive_agent_endpoint(target_id, {"archived": False})
+            assert unarch_res["ok"] is True
+            assert unarch_res["agent"]["archived"] is False
 
-        # Test Workspace Title Rename & Sync
-        ren_res = await rename_agent_endpoint(
-            target_id,
-            {"title": original_title},
-        )
-        assert ren_res["ok"] is True
-        assert ren_res["title"] == original_title
-
-        trig = await trigger_test_permission(target_id)
-        assert trig["ok"] is True
-        perm_id = trig["permission"]["id"]
-
-        import pac_neon.server as srv_mod
-        with patch.object(
-            srv_mod,
-            "inject_input_into_live_terminal",
-            return_value={"injected": True, "method": "mock_terminal", "detail": "Injetado em teste"},
-        ):
-            res = await resolve_permission(
-                perm_id,
-                ResolvePermissionRequest(action=PermissionResolutionAction.ALLOW),
-            )
-            assert res["ok"] is True
-
-            cmd_res = await send_agent_command(
+            # Test Workspace Title Rename & Sync
+            ren_res = await rename_agent_endpoint(
                 target_id,
-                DirectCommandRequest(prompt="Rode os testes de contrato REST", auto_enter=True),
+                {"title": original_title},
             )
-            assert cmd_res["ok"] is True
+            assert ren_res["ok"] is True
+            assert ren_res["title"] == original_title
 
-        second_id = data["agents"][1]["id"]
-        warp_res = await send_warp_fruit(
-            SendWarpFruitRequest(
-                source_agent_id=target_id,
-                target_agent_id=second_id,
-                fruit_type="cherry_contract",
-                title="pix-contract.json",
-                content="POST /v1/pix/installments com header X-Idempotency-Key",
+            trig = await trigger_test_permission(target_id)
+            assert trig["ok"] is True
+            perm_id = trig["permission"]["id"]
+
+            with patch.object(
+                srv_mod,
+                "inject_input_into_live_terminal",
+                return_value={"injected": True, "method": "mock_terminal", "detail": "Injetado em teste"},
+            ):
+                res = await resolve_permission(
+                    perm_id,
+                    ResolvePermissionRequest(action=PermissionResolutionAction.ALLOW),
+                )
+                assert res["ok"] is True
+
+                cmd_res = await send_agent_command(
+                    target_id,
+                    DirectCommandRequest(prompt="Rode os testes de contrato REST", auto_enter=True),
+                )
+                assert cmd_res["ok"] is True
+
+            second_id = data["agents"][1]["id"]
+            warp_res = await send_warp_fruit(
+                SendWarpFruitRequest(
+                    source_agent_id=target_id,
+                    target_agent_id=second_id,
+                    fruit_type="cherry_contract",
+                    title="pix-contract.json",
+                    content="POST /v1/pix/installments com header X-Idempotency-Key",
+                )
             )
-        )
-        assert warp_res["ok"] is True
+            assert warp_res["ok"] is True
 
     asyncio.run(_run())
 
@@ -310,6 +310,35 @@ def test_claude_adapter_discovers_waiting_for_attention_and_terminal_mirror():
     for ag in agents:
         assert isinstance(ag.terminal_tail, list)
         assert len(ag.terminal_tail) > 0
+
+
+import unittest
+
+
+class TestPacNeonMaturitySuite(unittest.TestCase):
+    def test_01_superset_bridge_discovers_worktrees_and_blocked_permissions(self):
+        test_superset_bridge_discovers_worktrees_and_blocked_permissions()
+
+    def test_02_superset_bridge_sends_permission_keystroke(self):
+        test_superset_bridge_sends_permission_keystroke()
+
+    def test_03_antigravity_adapter_discovers_live_transcript(self):
+        test_antigravity_adapter_discovers_live_transcript()
+
+    def test_04_pluggable_adapter_registry_for_future_agents(self):
+        test_pluggable_adapter_registry_for_future_agents()
+
+    def test_05_anti_hallucination_and_context_telemetry_metrics(self):
+        test_anti_hallucination_and_context_telemetry_metrics()
+
+    def test_06_portable_repository_discovery_and_environment_doctor(self):
+        test_portable_repository_discovery_and_environment_doctor()
+
+    def test_07_claude_adapter_discovers_waiting_for_attention_and_terminal_mirror(self):
+        test_claude_adapter_discovers_waiting_for_attention_and_terminal_mirror()
+
+    def test_08_hub_endpoints_and_permission_approval(self):
+        test_hub_endpoints_and_permission_approval()
 
 
 if __name__ == "__main__":

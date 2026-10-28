@@ -291,7 +291,10 @@ def compute_context_and_hallucination_metrics(
         signals.append("🌀 Espiral de busca: muitas leituras seguidas sem progresso de código")
 
     if thrashing_count >= 3 and thrashing_target:
-        signals.append(f"Loop detectado: {thrashing_count} falhas seguidas em {thrashing_target}")
+        if recent_tool_errors > 0:
+            signals.append(f"Loop detectado: {thrashing_count} falhas seguidas em {thrashing_target}")
+        else:
+            signals.append(f"Loop detectado: {thrashing_count} repetições seguidas em {thrashing_target}")
     elif thrashing_count >= 3:
         signals.append(f"Loop detectado: {thrashing_count} chamadas repetidas seguidas na mesma ferramenta")
 

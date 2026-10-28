@@ -1152,10 +1152,12 @@ def install_pac_neon_agent_hooks(port: int = 8765) -> bool:
         notify_script = hooks_dir / "notify.sh"
 
         script_content = f"""#!/bin/bash
-# Pac-Neon Native Agent Lifecycle & Permission Gate Hook (Herdr / Superset compatible)
-# - For PermissionRequest: blocks synchronously (up to 600s) waiting for user click in Pac-Neon
-#   and outputs Claude Code's native `hookSpecificOutput` JSON decision to stdout.
-# - For all other lifecycle events: sends a fast non-blocking background POST (<10ms).
+# Pac-Neon Agent Lifecycle & Native Background Permission Hook
+# - For normal telemetry events (PreToolUse, PostToolUse, UserPromptSubmit, Stop, SessionStart, SessionEnd, Notification):
+#   always runs asynchronously in background (<5ms) and exits 0 immediately so it NEVER blocks or delays agent execution.
+# - For PermissionRequest (when Claude Code is ALREADY displaying the interactive [1] Yes / [2] Always / [3] No prompt):
+#   Claude Code runs PermissionRequest hooks in parallel with the interactive terminal dialog (`jm9`).
+#   Returns `hookSpecificOutput` JSON if approved/denied from the Pac-Neon panel so the agent continues in background without focusing the IDE!
 
 if [ -n "$1" ]; then
   INPUT="$1"
@@ -1165,19 +1167,19 @@ fi
 
 [ -z "$INPUT" ] && exit 0
 
-if printf '%s' "$INPUT" | grep -q '"hook_event_name"[[:space:]]*:[[:space:]]*"PermissionRequest"'; then
-  RESPONSE=$(curl -sS -X POST "http://127.0.0.1:{port}/api/hooks/agent-event" \\
-    --connect-timeout 0.6 --max-time 600 \\
+if printf '%s' "$INPUT" | grep -q '"hook_event_name"[[:space:]]*:[[:space:]]*"PermissionRequest"' && ! printf '%s' "$INPUT" | grep -q '"agent_id"'; then
+  RESP=$(curl -sX POST "http://127.0.0.1:{port}/api/hooks/agent-event" \\
+    --connect-timeout 0.35 --max-time 300 \\
     -H "Content-Type: application/json" \\
-    -d "$INPUT" 2>/dev/null)
-  if [ -n "$RESPONSE" ] && printf '%s' "$RESPONSE" | grep -q '"hookSpecificOutput"'; then
-    printf '%s\\n' "$RESPONSE"
+    -d "$INPUT" 2>/dev/null || true)
+  if [ -n "$RESP" ] && printf '%s' "$RESP" | grep -q '"hookSpecificOutput"'; then
+    printf '%s\\n' "$RESP"
   fi
   exit 0
 fi
 
 curl -sX POST "http://127.0.0.1:{port}/api/hooks/agent-event" \\
-  --connect-timeout 0.4 --max-time 0.8 \\
+  --connect-timeout 0.3 --max-time 0.8 \\
   -H "Content-Type: application/json" \\
   -d "$INPUT" >/dev/null 2>&1 &
 
@@ -1219,6 +1221,23 @@ exit 0
         }
 
         changed = False
+        # Clean up any legacy blocking pac_neon_hook.py entries from earlier versions
+        for ev_key, ev_entries in list(hooks_obj.items()):
+            if not isinstance(ev_entries, list):
+                continue
+            filtered_entries = []
+            for entry in ev_entries:
+                if isinstance(entry, dict):
+                    has_legacy = any(
+                        isinstance(h, dict) and "pac_neon_hook.py" in str(h.get("command", ""))
+                        for h in (entry.get("hooks") or [])
+                    )
+                    if has_legacy:
+                        changed = True
+                        continue
+                filtered_entries.append(entry)
+            hooks_obj[ev_key] = filtered_entries
+
         for event_name, matcher in managed_events.items():
             event_list = hooks_obj.setdefault(event_name, [])
             if not isinstance(event_list, list):

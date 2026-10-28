@@ -18,7 +18,7 @@ class BaseAgentAdapter(ABC):
         """Scans local logs, transcripts, or processes to discover running/recent agents."""
         raise NotImplementedError
 
-    def format_approval_Sequence(self, action: str, custom_text: Optional[str] = None) -> str:
+    def format_approval_sequence(self, action: str, custom_text: Optional[str] = None) -> str:
         """Returns the exact PTY stdin sequence to approve/deny a permission prompt for this CLI."""
         if custom_text:
             return custom_text.rstrip("\r\n") + "\r"
@@ -29,6 +29,9 @@ class BaseAgentAdapter(ABC):
         if action == "deny":
             return "n\r"
         return "\r"
+
+    def format_approval_Sequence(self, action: str, custom_text: Optional[str] = None) -> str:
+        return self.format_approval_sequence(action, custom_text)
 
 
 class GenericPluginAdapter(BaseAgentAdapter):

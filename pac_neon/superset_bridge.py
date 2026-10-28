@@ -234,7 +234,7 @@ class SupersetBridge:
             return self.send_to_terminal(workspace_id, terminal_id, text="n")
         if action == PermissionResolutionAction.ALWAYS:
             # In Claude Code / Gemini CLI, '2' or 'a' often approves for the session
-            return self.send_to_terminal(workspace_id, terminal_id, text="y")
+            return self.send_to_terminal(workspace_id, terminal_id, text="2")
         return self.send_to_terminal(workspace_id, terminal_id, text="y")
 
     def spawn_agent_in_workspace(
@@ -279,6 +279,12 @@ class SupersetBridge:
         except Exception:
             pass
         return deep_link
+
+    def open_workspace_in_superset_ui(
+        self, workspace_id: str, terminal_id: Optional[str] = None
+    ) -> str:
+        """Alias for `open_in_superset_desktop` used by the orchestrator server."""
+        return self.open_in_superset_desktop(workspace_id, terminal_id)
 
     def discover_from_snapshot(self) -> List[AgentUnit]:
         """Calls `superset snapshot --json` to discover all workspaces, terminals, and blocked agents."""

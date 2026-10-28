@@ -42,8 +42,12 @@ class AntigravityAdapter(BaseAgentAdapter):
             supports_hooks=True,
         )
 
-    _RPC_CACHE: tuple[float, List[tuple[int, str]]] = (0.0, [])
     _CASCADE_ENDPOINT_MAP: Dict[str, tuple[int, str]] = {}
+
+    @classmethod
+    def _discover_servers(cls, force: bool = False) -> List[tuple[int, str]]:
+        """Alias for _discover_rpc_endpoints."""
+        return cls._discover_rpc_endpoints(force=force)
 
     @classmethod
     def _discover_rpc_endpoints(cls, force: bool = False) -> List[tuple[int, str]]:
@@ -1114,11 +1118,13 @@ class AntigravityAdapter(BaseAgentAdapter):
                 if stype == "USER_INPUT":
                     if ev_ts > 0:
                         last_user_input_epoch = ev_ts
-                    if "<CONTEXT_SUMMARY>" in content_str:
+                    if "<CONTEXT_SUMMARY>" in content_str or "HANDOFF DE CONTINUIDADE" in content_str:
                         saw_compaction_in_tail = True
                         accum_tail_bytes = len(raw.encode("utf-8", errors="replace"))
                         truncated_steps_count = 0
-                        if "<USER_REQUEST>" not in content_str:
+                        tool_events_history.clear()
+                        recent_interruptions = 0
+                        if "<CONTEXT_SUMMARY>" in content_str and "<USER_REQUEST>" not in content_str:
                             continue
                     pending_tool_info = None
                     pending_perm = None
@@ -1317,10 +1323,10 @@ class AntigravityAdapter(BaseAgentAdapter):
             if saw_compaction_in_tail and accum_tail_bytes > 0:
                 bytes_since_compaction = accum_tail_bytes
             elif accum_tail_bytes > 0 and len(lines) > 80:
-                # Check if an earlier <CONTEXT_SUMMARY> exists in lines
+                # Check if an earlier <CONTEXT_SUMMARY> or Self-Handoff checkpoint exists in lines
                 last_comp_idx = -1
                 for idx_ln in range(len(lines) - 1, -1, -1):
-                    if "<CONTEXT_SUMMARY>" in lines[idx_ln]:
+                    if "<CONTEXT_SUMMARY>" in lines[idx_ln] or "HANDOFF DE CONTINUIDADE" in lines[idx_ln]:
                         last_comp_idx = idx_ln
                         break
                 if last_comp_idx >= 0:
@@ -1678,8 +1684,8 @@ class AntigravityAdapter(BaseAgentAdapter):
             current_action = f"Parado / Pronto • {current_action[:110]}"
             terminal_tail.append("❯ [Turno concluído — aguardando próxima instrução]")
 
-        # Conversations older than 6 hours default to archived (History) so the active workspace stays clean
-        default_archived = (game_state == AgentGameState.IDLE) and (age_seconds > (6 * 3600))
+        # Never auto-archive conversations to History; archiving happens only via explicit user action
+        default_archived = False
 
         artifacts = [
             p.name

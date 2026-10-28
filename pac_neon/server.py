@@ -96,6 +96,7 @@ from pac_neon.models import (
     SelfHandoffRequest,
     SendWarpFruitRequest,
     SpawnAgentRequest,
+    compute_context_and_hallucination_metrics,
     utc_now_iso,
 )
 from pac_neon.neon_cli_bridge import NeonCliBridge, install_pac_neon_agent_hooks
@@ -750,11 +751,12 @@ class ArcadeOrchestratorHub:
         self.ws_clients: Set[WebSocket] = set()
         self.high_score: int = 0
         self.archived_overrides: Dict[str, bool] = {}
+        self.archived_at_ts: Dict[str, float] = {}
         self.archived_snapshots: Dict[str, Dict[str, Any]] = {}
         self.custom_titles: Dict[str, str] = {}
         self.dismissed_perm_mtime: Dict[str, float] = {}
         self.notified_perm_timestamps: Dict[str, float] = {}
-        self.self_handoff_overrides: Dict[str, float] = {}
+        self.self_handoff_overrides: Dict[str, Any] = {}
         self.notification_timeout_sec: float = 60.0
         self.meeting_guard = MeetingCalendarGuard()
         self.user_meeting_settings_map: Dict[str, Any] = {}
@@ -791,11 +793,16 @@ class ArcadeOrchestratorHub:
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8", errors="replace"))
             self.archived_overrides = dict(data.get("archived_overrides") or {})
+            self.archived_at_ts = {
+                k: float(v) for k, v in (data.get("archived_at_ts") or {}).items()
+            }
             self.archived_snapshots = dict(data.get("archived_snapshots") or {})
             self.custom_titles = dict(data.get("custom_titles") or {})
             self.dismissed_perm_mtime = {
                 k: float(v) for k, v in (data.get("dismissed_perm_mtime") or {}).items()
             }
+            if isinstance(data.get("self_handoff_overrides"), dict):
+                self.self_handoff_overrides = dict(data["self_handoff_overrides"])
             if data.get("notification_timeout_sec") is not None:
                 try:
                     self.notification_timeout_sec = max(5.0, min(3600.0, float(data["notification_timeout_sec"])))
@@ -804,14 +811,32 @@ class ArcadeOrchestratorHub:
             if isinstance(data.get("user_meeting_settings"), dict):
                 self.user_meeting_settings_map = dict(data["user_meeting_settings"])
             self.meeting_guard.load_from_dict(data)
-            for aid, snap in self.archived_snapshots.items():
+            healed_state = False
+            for aid, snap in list(self.archived_snapshots.items()):
                 if isinstance(snap, dict) and aid not in self.agents:
                     try:
                         snap_copy = dict(snap)
+                        was_id_corrupted = bool(snap_copy.get("id") and snap_copy.get("id") != aid)
+                        snap_copy["id"] = aid
                         if isinstance(snap_copy.get("pending_permission"), dict):
                             snap_copy["pending_permission"] = PermissionRequestItem(**snap_copy["pending_permission"])
                         unit = AgentUnit(**snap_copy)
-                        unit.archived = bool(self.archived_overrides.get(aid, True))
+                        unit.id = aid
+                        # Verify whether saved PID is still alive; if dead, clear stale PID and TTY
+                        if unit.pid:
+                            try:
+                                os.kill(int(unit.pid), 0)
+                            except OSError:
+                                unit.pid = None
+                                unit.tty = None
+                        if was_id_corrupted:
+                            # Heal snapshot that was previously collided with an older session on the same TTY
+                            self.archived_overrides.pop(aid, None)
+                            self.archived_at_ts.pop(aid, None)
+                            unit.archived = False
+                            healed_state = True
+                        else:
+                            unit.archived = bool(self.archived_overrides.get(aid, False))
                         if aid in self.custom_titles:
                             unit.workspace_title = self.custom_titles[aid]
                             unit.name = self.custom_titles[aid]
@@ -829,6 +854,8 @@ class ArcadeOrchestratorHub:
                         self.agents[aid] = unit
                     except Exception:
                         continue
+            if healed_state:
+                self._save_workspace_state()
         except Exception:
             pass
 
@@ -837,14 +864,19 @@ class ArcadeOrchestratorHub:
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             for aid, ag in self.agents.items():
-                if ag.archived:
+                ag.id = aid
+                if ag.archived and bool(self.archived_overrides.get(aid, False)):
                     self.archived_snapshots[aid] = ag.model_dump()
+                else:
+                    self.archived_snapshots.pop(aid, None)
             self.user_meeting_settings_map = self.meeting_guard.dump_for_storage(self.user_meeting_settings_map)
             payload = {
                 "archived_overrides": self.archived_overrides,
+                "archived_at_ts": self.archived_at_ts,
                 "archived_snapshots": self.archived_snapshots,
                 "custom_titles": self.custom_titles,
                 "dismissed_perm_mtime": self.dismissed_perm_mtime,
+                "self_handoff_overrides": self.self_handoff_overrides,
                 "notification_timeout_sec": self.notification_timeout_sec,
                 "user_meeting_settings": self.user_meeting_settings_map,
                 "meeting_settings": dict(self.meeting_guard.settings),
@@ -863,7 +895,10 @@ class ArcadeOrchestratorHub:
         ag.updated_at = utc_now_iso()
         self.archived_overrides[agent_id] = archived
         if archived:
+            self.archived_at_ts[agent_id] = time.time()
             self.archived_snapshots[agent_id] = ag.model_dump()
+        else:
+            self.archived_at_ts.pop(agent_id, None)
         self._save_workspace_state()
         return ag
 
@@ -934,10 +969,28 @@ class ArcadeOrchestratorHub:
         superset_units = self.superset_bridge.discover_from_snapshot()
         discovered.extend(superset_units)
 
+        discovered_ids_this_cycle: Set[str] = set()
+
         for disc in discovered:
-            # Apply user's explicit archive/unarchive preference if set
+            # Never auto-archive agents to History: an agent is archived ONLY if explicitly set by the user in archived_overrides.
+            # Even if archived by the user earlier, automatically unarchive if it starts actively working or has new activity.
             if disc.id in self.archived_overrides:
-                disc.archived = self.archived_overrides[disc.id]
+                want_archived = bool(self.archived_overrides[disc.id])
+                if want_archived:
+                    arch_ts = float(self.archived_at_ts.get(disc.id, 0.0))
+                    has_new_activity = (arch_ts > 0.0 and (disc.last_active_ts or 0.0) > arch_ts + 2.0)
+                    is_working_now = disc.game_state != AgentGameState.IDLE
+                    is_live_unarchived_proc = bool(disc.pid) and (arch_ts == 0.0 or has_new_activity)
+                    if is_working_now or has_new_activity or is_live_unarchived_proc:
+                        self.archived_overrides[disc.id] = False
+                        self.archived_at_ts.pop(disc.id, None)
+                        disc.archived = False
+                    else:
+                        disc.archived = True
+                else:
+                    disc.archived = False
+            else:
+                disc.archived = False
 
             # Apply user's custom title if set
             if disc.id in self.custom_titles:
@@ -1001,14 +1054,33 @@ class ArcadeOrchestratorHub:
             # Apply real-time push Hook state overrides (from ~/.pac-neon/hooks/notify.sh) only while fresh
             now_ts = time.time()
             hook_ov = self.hook_state_overrides.get(disc.id)
+            has_waiting_hook_ev = disc.id in self.agent_hook_events
             if hook_ov:
                 ov_ts = float(hook_ov.get("ts", 0.0))
                 ov_state = hook_ov.get("game_state")
-                has_waiting_hook_ev = disc.id in self.agent_hook_events
+                if (
+                    has_waiting_hook_ev
+                    and disc.last_active_ts > (ov_ts + 2.0)
+                    and disc.game_state != AgentGameState.POWER_PELLET_WAIT
+                ):
+                    stale_id = self.agent_hook_events.pop(disc.id, None)
+                    if stale_id:
+                        ev_stale = self.hook_events.pop(stale_id, None)
+                        if ev_stale:
+                            self.hook_results[stale_id] = {"resolved_in_terminal": True}
+                            ev_stale.set()
+                    has_waiting_hook_ev = False
+                # Note: Claude flushes .jsonl ~50-300ms AFTER invoking the hook script, so allow +1.5s tolerance
                 if ov_state == AgentGameState.POWER_PELLET_WAIT:
-                    is_fresh_ov = has_waiting_hook_ev or ((now_ts - ov_ts) < 12.0 and ov_ts >= disc.last_active_ts)
+                    is_fresh_ov = has_waiting_hook_ev or (
+                        (now_ts - ov_ts) < 180.0 and disc.last_active_ts <= (ov_ts + 1.5)
+                    )
+                elif ov_state == AgentGameState.IDLE:
+                    is_fresh_ov = (now_ts - ov_ts) < 15.0 and disc.last_active_ts <= (ov_ts + 1.5)
                 else:
-                    is_fresh_ov = (now_ts - ov_ts) < 8.0 and ov_ts >= disc.last_active_ts
+                    # Working override (UserPromptSubmit / PreToolUse / PostToolUse):
+                    # Keep active up to 45s unless .jsonl already detected a true working/permission state or ended turn >1.5s later
+                    is_fresh_ov = (now_ts - ov_ts) < 45.0 and disc.last_active_ts <= (ov_ts + 1.5)
                 if is_fresh_ov:
                     if isinstance(ov_state, AgentGameState):
                         disc.game_state = ov_state
@@ -1016,32 +1088,46 @@ class ArcadeOrchestratorHub:
                         disc.current_action = str(hook_ov["current_action"])
                     if "pending_permission" in hook_ov:
                         disc.pending_permission = hook_ov["pending_permission"]
-                else:
+                elif (now_ts - ov_ts) >= 180.0 or disc.last_active_ts > (ov_ts + 2.0):
                     self.hook_state_overrides.pop(disc.id, None)
 
-            # Respect user's dismissal/resolution if transcript hasn't changed since dismissal
+            # Respect user's dismissal/resolution if transcript hasn't changed since dismissal (unless a new hook is waiting)
             dismissed_ts = self.dismissed_perm_mtime.get(disc.id, 0.0)
-            if disc.pending_permission is not None and dismissed_ts > 0 and disc.last_active_ts <= dismissed_ts + 0.5:
+            ov_ts_curr = float(hook_ov.get("ts", 0.0)) if hook_ov else 0.0
+            if (
+                disc.pending_permission is not None
+                and not has_waiting_hook_ev
+                and dismissed_ts > 0
+                and max(disc.last_active_ts or 0.0, ov_ts_curr) <= dismissed_ts + 0.5
+            ):
                 disc.pending_permission = None
                 if disc.game_state == AgentGameState.POWER_PELLET_WAIT:
                     disc.game_state = AgentGameState.IDLE
 
-            # Match against existing agents by id, session_id, pid, tty, or recently spawned same-(provider, repo_path)
+            # Match against existing agents by id, session_id, or (ONLY for unlinked/placeholder agents) pid/tty/repo_path
             matched_existing_id: Optional[str] = None
             if disc.id in self.agents:
                 matched_existing_id = disc.id
             else:
                 disc_short_tty = (disc.tty or "").replace("/dev/", "").strip()
+                disc_sid = str(disc.session_id or "").strip()
+                disc_has_real_sid = bool(disc_sid and not disc_sid.startswith("pid-"))
                 for cand_id, cand in list(self.agents.items()):
-                    if cand.session_id and disc.session_id and cand.session_id == disc.session_id:
+                    cand_sid = str(cand.session_id or "").strip()
+                    cand_has_real_sid = bool(cand_sid and not cand_sid.startswith("pid-"))
+                    if cand_sid and disc_sid and cand_sid == disc_sid:
                         matched_existing_id = cand_id
                         break
+                    # NEVER merge two distinct real conversations (e.g. an old session and a new session on the same TTY)
+                    if cand_has_real_sid and disc_has_real_sid and cand_sid != disc_sid:
+                        continue
                     if cand.pid and disc.pid and cand.pid == disc.pid:
                         matched_existing_id = cand_id
                         break
                     cand_short_tty = (cand.tty or "").replace("/dev/", "").strip()
                     if (
-                        cand_short_tty
+                        not cand_has_real_sid
+                        and cand_short_tty
                         and disc_short_tty
                         and cand_short_tty == disc_short_tty
                         and cand.provider == disc.provider
@@ -1065,21 +1151,24 @@ class ArcadeOrchestratorHub:
                 if existing_cand.control_mode == "pty" and matched_existing_id in self.pty_manager.sessions:
                     disc.id = matched_existing_id
                 else:
-                    self.agents[disc.id] = self.agents.pop(matched_existing_id)
+                    moved_ag = self.agents.pop(matched_existing_id)
+                    moved_ag.id = disc.id
+                    self.agents[disc.id] = moved_ag
                     if matched_existing_id in self.custom_titles and disc.id not in self.custom_titles:
                         self.custom_titles[disc.id] = self.custom_titles.pop(matched_existing_id)
-                    if matched_existing_id in self.archived_overrides and disc.id not in self.archived_overrides:
-                        self.archived_overrides[disc.id] = self.archived_overrides.pop(matched_existing_id)
                     if matched_existing_id in self.active_panel_commands:
                         self.active_panel_commands[disc.id] = self.active_panel_commands.pop(matched_existing_id)
                     if matched_existing_id in self.recent_panel_lines:
                         self.recent_panel_lines[disc.id] = self.recent_panel_lines.pop(matched_existing_id)
+
+            discovered_ids_this_cycle.add(disc.id)
 
             if disc.id not in self.agents:
                 self.agents[disc.id] = disc
                 target_ag = disc
             else:
                 existing = self.agents[disc.id]
+                existing.id = disc.id
                 if isinstance(existing.pending_permission, dict):
                     try:
                         existing.pending_permission = PermissionRequestItem(**existing.pending_permission)
@@ -1097,8 +1186,8 @@ class ArcadeOrchestratorHub:
                 existing.repo_path = disc.repo_path or existing.repo_path
                 existing.branch = disc.branch or existing.branch
                 existing.session_id = disc.session_id or existing.session_id
-                existing.pid = disc.pid or existing.pid
-                existing.tty = disc.tty or existing.tty
+                existing.pid = disc.pid
+                existing.tty = disc.tty
                 existing.host_app = disc.host_app or existing.host_app
                 existing.neon_color = disc.neon_color or existing.neon_color
                 existing.sprite_type = disc.sprite_type or existing.sprite_type
@@ -1125,8 +1214,16 @@ class ArcadeOrchestratorHub:
                 existing.last_active_ts = disc.last_active_ts or existing.last_active_ts
                 existing.score_xp = max(existing.score_xp, disc.score_xp)
                 existing.pellets_eaten = max(existing.score_xp // 150, existing.pellets_eaten, disc.pellets_eaten)
-                handoff_reset_ts = self.self_handoff_overrides.get(disc.id, 0.0)
-                if handoff_reset_ts > 0 and (now_ts - handoff_reset_ts) < 45.0:
+                handoff_entry = self.self_handoff_overrides.get(disc.id)
+                handoff_reset_ts = 0.0
+                handoff_baseline_tokens = 0
+                if isinstance(handoff_entry, dict):
+                    handoff_reset_ts = float(handoff_entry.get("ts") or 0.0)
+                    handoff_baseline_tokens = int(handoff_entry.get("baseline_tokens") or 0)
+                elif isinstance(handoff_entry, (int, float)):
+                    handoff_reset_ts = float(handoff_entry)
+
+                if handoff_reset_ts > 0 and (now_ts - handoff_reset_ts) < 60.0:
                     existing.context_health_pct = 100
                     existing.hallucination_risk_pct = 0
                     existing.health_status = "HEALTHY"
@@ -1135,9 +1232,30 @@ class ArcadeOrchestratorHub:
                     existing.active_elapsed_sec = 0
                     existing.is_stalled = False
                     existing.health_signals = []
+                elif (
+                    handoff_reset_ts > 0
+                    and handoff_baseline_tokens > 3000
+                    and (disc.context_tokens_used or 0) >= handoff_baseline_tokens
+                ):
+                    eff_tokens = max(1500, int(disc.context_tokens_used or 0) - handoff_baseline_tokens + 1500)
+                    recomputed = compute_context_and_hallucination_metrics(
+                        tokens_used=eff_tokens,
+                        tokens_limit=disc.context_tokens_limit or 200000,
+                        steps_count=10,
+                        recent_tool_errors=0,
+                        game_state=disc.game_state,
+                        age_seconds=max(0.0, now_ts - (disc.last_active_ts or now_ts)),
+                        active_elapsed_sec=disc.active_elapsed_sec,
+                    )
+                    existing.context_health_pct = recomputed["context_health_pct"]
+                    existing.hallucination_risk_pct = recomputed["hallucination_risk_pct"]
+                    existing.health_status = recomputed["health_status"]
+                    existing.context_tokens_used = recomputed["context_tokens_used"]
+                    existing.context_tokens_limit = recomputed["context_tokens_limit"]
+                    existing.active_elapsed_sec = recomputed["active_elapsed_sec"]
+                    existing.is_stalled = recomputed["is_stalled"]
+                    existing.health_signals = list(recomputed["health_signals"])
                 else:
-                    if handoff_reset_ts > 0:
-                        self.self_handoff_overrides.pop(disc.id, None)
                     existing.context_health_pct = disc.context_health_pct
                     existing.hallucination_risk_pct = disc.hallucination_risk_pct
                     existing.health_status = disc.health_status
@@ -1213,6 +1331,7 @@ class ArcadeOrchestratorHub:
         # Ensure any older restored agent not returned in this discovery cycle is marked IDLE
         discovered_ids = {d.id for d in discovered}
         for ag_id, ag_unit in list(self.agents.items()):
+            ag_unit.id = ag_id
             if ag_unit.provider == "antigravity":
                 ag_unit.neon_color = "#0078D9"
             if ag_id not in discovered_ids and ag_unit.control_mode != "pty" and ag_id not in self.agent_hook_events:
@@ -1227,6 +1346,7 @@ class ArcadeOrchestratorHub:
                         os.kill(ag_unit.pid, 0)
                     except OSError:
                         ag_unit.pid = None
+                        ag_unit.tty = None
 
     def sync_live_agents(self, force: bool = False) -> None:
         now = time.time()
@@ -1404,7 +1524,9 @@ _KNOWN_TERMINAL_APPS = (
     "Warp",
     "Ghostty",
     "Alacritty",
+    "Kitty",
     "WezTerm",
+    "Hyper",
 )
 
 _KNOWN_IDE_APPS = (
@@ -1417,6 +1539,13 @@ _KNOWN_IDE_APPS = (
     "PyCharm",
     "WebStorm",
     "GoLand",
+    "CLion",
+    "Rider",
+    "PhpStorm",
+    "RubyMine",
+    "DataGrip",
+    "Fleet",
+    "Zed",
     "Xcode",
 )
 
@@ -1560,7 +1689,7 @@ def _discover_available_hosts(superset_installed: bool = False) -> Dict[str, Any
         if host_id == "Antigravity" and not resolved:
             # Also check if Antigravity language server is currently running
             try:
-                if AntigravityAdapter._discover_servers():
+                if AntigravityAdapter._discover_rpc_endpoints():
                     resolved = "Antigravity"
             except Exception:
                 pass
@@ -1699,7 +1828,7 @@ def run_environment_doctor() -> Dict[str, Any]:
     ax_trusted = _is_macos_accessibility_trusted(False)
     agy_servers = []
     try:
-        agy_servers = AntigravityAdapter._discover_servers()
+        agy_servers = AntigravityAdapter._discover_rpc_endpoints()
     except Exception:
         pass
 
@@ -1971,6 +2100,57 @@ def _focus_macos_ide_window_by_title(search_tokens: List[str], preferred_app: Op
         return None
 
 
+def _focus_window_by_title_in_process(app_names: List[str], search_tokens: List[str]) -> Optional[str]:
+    """Activates the target IDE application and raises the window matching search_tokens if multiple windows exist."""
+    if sys.platform != "darwin" or not app_names:
+        return None
+    primary = app_names[0]
+    activated = _focus_macos_ide_window_by_title(search_tokens, preferred_app=primary)
+    tokens = [t.replace('"', "'").strip() for t in search_tokens if t and len(t.strip()) >= 3]
+    if not tokens:
+        return activated
+    proc_candidates = list(dict.fromkeys(
+        app_names
+        + [
+            "idea" if "intellij" in primary.lower() else primary,
+            "studio" if "android studio" in primary.lower() else primary,
+            "pycharm" if "pycharm" in primary.lower() else primary,
+            "webstorm" if "webstorm" in primary.lower() else primary,
+            "goland" if "goland" in primary.lower() else primary,
+            "Code" if "visual studio code" in primary.lower() else primary,
+        ]
+    ))
+    proc_conds = " or ".join(f'(name of p is "{c.replace(chr(34), chr(39))}")' for c in proc_candidates if c)
+    win_conds = " or ".join(f'(name of w contains "{t}")' for t in tokens[:3])
+    if proc_conds and win_conds:
+        ax_script = f'''
+        tell application "System Events"
+            repeat with p in (every process whose background only is false)
+                try
+                    if {proc_conds} then
+                        set frontmost of p to true
+                        repeat with w in windows of p
+                            if {win_conds} then
+                                perform action "AXRaise" of w
+                                return (name of p) & " (" & (name of w) & ")"
+                            end if
+                        end repeat
+                    end if
+                end try
+            end repeat
+        end tell
+        return ""
+        '''
+        try:
+            res = subprocess.run(["osascript", "-e", ax_script], capture_output=True, text=True, timeout=2.0)
+            out = (res.stdout or "").strip()
+            if out:
+                return out
+        except Exception:
+            pass
+    return activated
+
+
 def _open_and_activate_mac_app(app_name: str, folder_path: Optional[str] = None) -> None:
     """Activates a macOS app and focuses its window. Never passes folder_path to Terminal/iTerm to avoid spawning new windows."""
     if "antigravity" in app_name.lower():
@@ -2221,15 +2401,152 @@ def _echo_to_agent_tty(ag: AgentUnit, text_line: str) -> None:
         pass
 
 
+def _resolve_host_gui_pids(ag: AgentUnit) -> List[int]:
+    """Finds the target GUI / terminal host PIDs (e.g. IntelliJ `idea`, Cursor, VS Code, Terminal) by walking `ppid` from `ag.pid`."""
+    pids: List[int] = []
+    if ag.pid:
+        curr = int(ag.pid)
+        visited: Set[int] = set()
+        for _ in range(10):
+            if curr <= 1 or curr in visited:
+                break
+            visited.add(curr)
+            try:
+                cp = subprocess.run(
+                    ["ps", "-o", "ppid=,comm=", "-p", str(curr)],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                )
+                line = (cp.stdout or "").strip()
+                if not line:
+                    break
+                parts = line.split(None, 1)
+                ppid = int(parts[0])
+                comm = parts[1].lower() if len(parts) > 1 else ""
+                if any(
+                    k in comm
+                    for k in (
+                        "intellij idea.app/contents/macos/",
+                        "android studio.app/contents/macos/",
+                        "pycharm.app/contents/macos/",
+                        "webstorm.app/contents/macos/",
+                        "goland.app/contents/macos/",
+                        "cursor.app/contents/macos/",
+                        "visual studio code.app/contents/macos/",
+                        "antigravity.app/contents/macos/",
+                        "terminal.app/contents/macos/",
+                        "iterm.app/contents/macos/",
+                        "warp.app/contents/macos/",
+                        "/macos/idea",
+                        "/macos/studio",
+                    )
+                ):
+                    if curr not in pids:
+                        pids.append(curr)
+                curr = ppid
+            except Exception:
+                break
+        if int(ag.pid) not in pids:
+            pids.append(int(ag.pid))
+    return pids
+
+
+def _send_keystroke_to_pid_background(
+    ag: AgentUnit,
+    clean_text: str,
+    auto_enter: bool = True,
+    is_permission_key: bool = False,
+) -> dict:
+    """
+    Posts keystrokes directly to the target process PID in the background using macOS CoreGraphics
+    (`CGEventCreateKeyboardEvent` + `CGEventKeyboardSetUnicodeString` + `CGEventPostToPid`)
+    WITHOUT activating the IDE window or stealing screen focus!
+    """
+    if sys.platform != "darwin":
+        return {"injected": False}
+    target_pids = _resolve_host_gui_pids(ag)
+    if not target_pids:
+        return {"injected": False}
+
+    try:
+        import ctypes
+
+        cg = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        cg.CGEventCreateKeyboardEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint16, ctypes.c_bool]
+        cg.CGEventCreateKeyboardEvent.restype = ctypes.c_void_p
+        cg.CGEventKeyboardSetUnicodeString.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_wchar_p,
+        ]
+        cg.CGEventKeyboardSetUnicodeString.restype = None
+        cg.CGEventPostToPid.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        cg.CGEventPostToPid.restype = None
+        cg.CFRelease.argtypes = [ctypes.c_void_p]
+        cg.CFRelease.restype = None
+
+        vk_map = {
+            "1": 18,
+            "2": 19,
+            "3": 20,
+            "4": 21,
+            "y": 16,
+            "n": 45,
+            "a": 0,
+        }
+
+        def _post_vk(pid: int, vk: int, ch: Optional[str] = None) -> None:
+            for down in (True, False):
+                ev = cg.CGEventCreateKeyboardEvent(None, vk, down)
+                if ev:
+                    if ch:
+                        cg.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
+                    cg.CGEventPostToPid(pid, ev)
+                    cg.CFRelease(ev)
+
+        gui_pid = target_pids[0]
+        upper = clean_text.upper()
+        if upper == "ESC":
+            _post_vk(gui_pid, 53)
+        elif upper == "ENTER" or clean_text == "":
+            _post_vk(gui_pid, 36)
+        elif len(clean_text) == 1 and clean_text.lower() in vk_map:
+            vk = vk_map[clean_text.lower()]
+            _post_vk(gui_pid, vk, clean_text)
+            if auto_enter:
+                time.sleep(0.04)
+                _post_vk(gui_pid, 36)
+        else:
+            for ch in clean_text:
+                _post_vk(gui_pid, 0, ch)
+            if auto_enter:
+                time.sleep(0.05)
+                _post_vk(gui_pid, 36)
+
+        host_lbl = ag.host_app or "IDE/Terminal"
+        return {
+            "injected": True,
+            "background": True,
+            "method": f"{host_lbl} Background CGEvent (PID {gui_pid})",
+        }
+    except Exception:
+        return {"injected": False}
+
+
 def inject_input_into_live_terminal(
     ag: AgentUnit,
     text: str,
     auto_enter: bool = True,
     is_permission_key: bool = False,
+    allow_focus_window: bool = False,
 ) -> dict:
     """
     Injects a command or permission key ('1', '2', '3', 'y', 'n', or full prompt) directly into
     the live terminal where the agent is running (iTerm2, Terminal.app, or IDE Integrated Terminal).
+    When `allow_focus_window=False` (default), NEVER activates or switches focus to the IDE window!
     """
     clean_text = text.rstrip("\r\n")
     if sys.platform != "darwin":
@@ -2296,10 +2613,28 @@ def inject_input_into_live_terminal(
         except Exception:
             pass
 
-    # Check if macOS Accessibility is enabled for System Events keystroke injection
+    # 2. If `allow_focus_window` is False (e.g., clicking "Permitir" or sending a background command from Pac-Neon),
+    # NEVER activate or switch focus to the IDE window! Deliver in background via CoreGraphics `CGEventPostToPid`.
+    if not allow_focus_window:
+        bg_res = _send_keystroke_to_pid_background(
+            ag,
+            clean_text,
+            auto_enter=auto_enter,
+            is_permission_key=is_permission_key,
+        )
+        if bg_res.get("injected"):
+            if short_tty:
+                _TTY_SCREEN_CACHE.pop(short_tty, None)
+            return bg_res
+        return {
+            "injected": False,
+            "clipboard_ready": True,
+            "method": f"{ag.host_app or 'Terminal'} (Background sem troca de janela)",
+        }
+
+    # Check if macOS Accessibility is enabled for System Events keystroke injection (only when allow_focus_window=True)
     ax_trusted = _is_macos_accessibility_trusted(prompt_user=False)
     if not ax_trusted:
-        # For Claude full prompts, do NOT steal window focus — let _run_claude_session_command_async execute cleanly!
         if ag.provider.lower() == "claude" and not is_permission_key:
             return {
                 "injected": False,
@@ -2307,26 +2642,16 @@ def inject_input_into_live_terminal(
                 "clipboard_ready": True,
                 "method": "Claude Session CLI",
             }
-        # For permission keys or Antigravity GUI actions, prompt macOS Accessibility once and focus window cleanly
         _is_macos_accessibility_trusted(prompt_user=True)
         target_ide = "Antigravity" if ag.provider == "antigravity" else (ag.host_app or "Terminal")
-        try:
-            subprocess.run(
-                ["osascript", "-e", f'tell application "{target_ide}" to activate'],
-                capture_output=True,
-                timeout=1.5,
-            )
-        except Exception:
-            pass
         return {
             "injected": False,
             "needs_accessibility": True,
-            "focused_window": target_ide,
             "clipboard_ready": True,
             "method": f"{target_ide} (Habilite 'Acessibilidade' no macOS p/ envio automático ou use Cmd+V)",
         }
 
-    # 2. Try Terminal.app tab selection + keystroke/paste injection (only if not running inside an IDE terminal)
+    # 3. Try Terminal.app tab selection + keystroke/paste injection (only when allow_focus_window=True)
     term_conds = []
     if short_tty and short_tty != "??" and ag.host_app not in _KNOWN_IDE_APPS:
         term_conds.append(f'(tty of t contains "{short_tty}")')
@@ -2393,11 +2718,13 @@ def inject_input_into_live_terminal(
         except Exception:
             pass
 
-    # 3. Try IDE Integrated Terminal (IntelliJ IDEA / Android Studio / VS Code / Cursor / Antigravity)
+    # 4. Try IDE Integrated Terminal (only when allow_focus_window=True)
     if ag.host_app in _KNOWN_IDE_APPS or ag.provider == "antigravity":
         target_ide = "Antigravity" if ag.provider == "antigravity" else (ag.host_app or "Antigravity")
-        # Focus the exact IDE window WITHOUT calling `open -a <IDE> <repo_dir>` so terminal focus inside the IDE is preserved!
-        focused_win = _focus_window_by_title_in_process([target_ide], tokens)
+        try:
+            focused_win = _focus_window_by_title_in_process([target_ide], tokens)
+        except Exception:
+            focused_win = None
         if not focused_win:
             try:
                 subprocess.run(["osascript", "-e", f'tell application "{target_ide}" to activate'], capture_output=True, timeout=1.5)
@@ -2411,21 +2738,21 @@ def inject_input_into_live_terminal(
         elif ag.provider == "antigravity" and is_permission_key and clean_text.lower() in ("y", "1"):
             send_stmt = "key code 36 using command down\ndelay 0.08\nkey code 36"
         elif is_single_key:
-            enter_part = "\ndelay 0.05\nkey code 36" if auto_enter else ""
+            enter_part = "\ndelay 0.08\nkey code 36" if auto_enter else ""
             send_stmt = f'keystroke "{clean_text}"{enter_part}'
         else:
-            enter_part = "\ndelay 0.1\nkey code 36" if auto_enter else ""
+            enter_part = "\ndelay 0.35\nkey code 36" if auto_enter else ""
             send_stmt = f'keystroke "v" using command down{enter_part}'
 
         key_script = f'''
-        delay 0.15
+        delay 0.28
         tell application "System Events"
             {send_stmt}
         end tell
         return "INJECTED:{target_ide}"
         '''
         try:
-            res = subprocess.run(["osascript", "-e", key_script], capture_output=True, text=True, timeout=2.5)
+            res = subprocess.run(["osascript", "-e", key_script], capture_output=True, text=True, timeout=3.5)
             out = (res.stdout or "").strip()
             if res.returncode == 0 and out.startswith("INJECTED:"):
                 return {"injected": True, "method": out.replace("INJECTED:", "")}
@@ -2665,17 +2992,33 @@ async def resolve_permission(perm_id: str, req: ResolvePermissionRequest) -> dic
             target_agent = ag
             break
 
-    # Fallback lookup by agent_id suffix if permission ID changed between hook & transcript poll
+    # Fallback lookup by agent_id suffix or active hook event if permission ID changed between hook & transcript poll
     if not target_agent:
         for ag in hub.agents.values():
-            if ag.pending_permission and (perm_id.endswith(ag.id) or ag.id in perm_id):
+            short_id = ag.id.split("-", 1)[-1]
+            if (ag.pending_permission or ag.id in hub.agent_hook_events) and (
+                perm_id.endswith(ag.id)
+                or ag.id in perm_id
+                or (len(short_id) >= 6 and short_id in perm_id)
+                or hub.agent_hook_events.get(ag.id) == perm_id
+            ):
                 target_agent = ag
                 break
 
-    if not target_agent or not target_agent.pending_permission:
+    if not target_agent or (not target_agent.pending_permission and target_agent.id not in hub.agent_hook_events):
         raise HTTPException(status_code=404, detail="Permissão não encontrada ou já resolvida.")
 
-    perm = target_agent.pending_permission
+    perm = target_agent.pending_permission or PermissionRequestItem(
+        id=perm_id,
+        agent_id=target_agent.id,
+        agent_name=target_agent.workspace_title or target_agent.name,
+        provider=target_agent.provider,
+        repo_name=target_agent.repo_name,
+        tool_name=target_agent.active_tool or "Permission Prompt",
+        command_preview=req.custom_text or "Permissão aprovada pelo painel",
+        reason="Resolvido pelo painel Pac-Neon",
+        channel="native_hook",
+    )
     adapter = AdapterRegistry.get(target_agent.provider)
     seq = (
         adapter.format_approval_Sequence(req.action.value, req.custom_text)
@@ -2732,7 +3075,7 @@ async def resolve_permission(perm_id: str, req: ResolvePermissionRequest) -> dic
         if hook_dispatched:
             live_injected_info = {
                 "injected": True,
-                "method": "Hook Nativo Claude Code (Tempo Real)",
+                "method": "Hook Nativo Claude Code (Tempo Real — Sem Troca de Janela)",
             }
             _echo_to_agent_tty(
                 target_agent,
@@ -2757,9 +3100,10 @@ async def resolve_permission(perm_id: str, req: ResolvePermissionRequest) -> dic
                     req.custom_text or ("n" if req.action == PermissionResolutionAction.DENY else "y"),
                     auto_enter=True,
                     is_permission_key=(not bool(req.custom_text)),
+                    allow_focus_window=False,
                 )
         else:
-            # 5b. For any permission not waiting on a blocking hook (terminal_prompt, sdk, etc.), inject into live terminal/IDE
+            # 5b. For any permission not waiting on a blocking hook (terminal_prompt, sdk, etc.), inject in background without focusing IDE!
             if req.custom_text:
                 key_to_send = req.custom_text
             elif target_agent.provider.lower() == "claude":
@@ -2776,6 +3120,7 @@ async def resolve_permission(perm_id: str, req: ResolvePermissionRequest) -> dic
                 key_to_send,
                 auto_enter=True,
                 is_permission_key=(not bool(req.custom_text)),
+                allow_focus_window=False,
             )
             if (
                 not live_injected_info.get("injected")
@@ -3191,6 +3536,21 @@ async def send_agent_command(agent_id: str, req: DirectCommandRequest) -> dict:
                         f"  ⎿  ⚡ Entregue direto ao console Antigravity via {live_result.get('method')}",
                     )
         else:
+            pre_send_ts = time.time()
+            jsonl_path: Optional[Path] = None
+            pre_jsonl_size = 0
+            pre_jsonl_mtime = 0.0
+            if ag.provider.lower() == "claude" and ag.session_id and not is_quick_key:
+                try:
+                    matches = list((Path.home() / ".claude" / "projects").rglob(f"{ag.session_id}.jsonl"))
+                    if matches:
+                        jsonl_path = matches[0]
+                        st_j = jsonl_path.stat()
+                        pre_jsonl_size = st_j.st_size
+                        pre_jsonl_mtime = st_j.st_mtime
+                except Exception:
+                    pass
+
             live_result = inject_input_into_live_terminal(
                 ag,
                 prompt_clean,
@@ -3199,6 +3559,31 @@ async def send_agent_command(agent_id: str, req: DirectCommandRequest) -> dict:
             )
             if live_result.get("injected"):
                 hub.record_panel_line(ag.id, f"  ⎿  ⚡ Enviado direto ao terminal ativo via {live_result.get('method')}")
+                # If sent via IDE keystroke (IntelliJ / VS Code / etc.), verify within 1.4s that the interactive
+                # Claude TUI inside the IDE actually received the prompt; otherwise automatically fallback to Claude CLI!
+                if (
+                    ag.provider.lower() == "claude"
+                    and ag.session_id
+                    and not is_quick_key
+                    and ag.host_app in _KNOWN_IDE_APPS
+                ):
+                    def _verify_ide_or_fallback() -> None:
+                        for _ in range(6):
+                            time.sleep(0.25)
+                            try:
+                                ov = hub.hook_state_overrides.get(ag.id) or {}
+                                if float(ov.get("ts") or 0.0) >= pre_send_ts:
+                                    return
+                                if jsonl_path and jsonl_path.exists():
+                                    st_now = jsonl_path.stat()
+                                    if st_now.st_size > pre_jsonl_size or st_now.st_mtime > pre_jsonl_mtime:
+                                        return
+                            except Exception:
+                                pass
+                        if ag.id not in hub.active_panel_procs:
+                            _run_claude_session_command_async(ag, prompt_clean)
+
+                    threading.Thread(target=_verify_ide_or_fallback, daemon=True).start()
             elif ag.provider.lower() == "claude" and ag.session_id and not is_quick_key:
                 # Execute directly via `claude --resume <session_id> -p --output-format stream-json --verbose`
                 started = _run_claude_session_command_async(ag, prompt_clean)
@@ -3565,8 +3950,8 @@ async def handoff_preview_agent(agent_id: str) -> dict:
 @app.post("/api/agents/{agent_id}/self-handoff")
 async def self_handoff_agent(agent_id: str, req: Optional[SelfHandoffRequest] = None) -> dict:
     """
-    Clears or compacts the current conversation and immediately injects a clean Continuity Handoff
-    package into the agent itself (or spawns a clean replacement cascade in Antigravity and archives the saturated one).
+    Executes in-place Continuity Handoff ('♻️ Limpar & Continuar Aqui') on the SAME agent without
+    spawning a new agent/cascade in Antigravity IDE or archiving the current agent.
     """
     ag = hub.agents.get(agent_id)
     if not ag:
@@ -3581,121 +3966,98 @@ async def self_handoff_agent(agent_id: str, req: Optional[SelfHandoffRequest] = 
     repo_dir = _resolve_valid_repo_dir(ag) or ag.repo_path or str(Path.home() / "Projects")
     ws_title = (ag.workspace_title or ag.name or ag.repo_name).strip()
     now_ts = time.time()
+    pre_tokens = max(0, int(ag.context_tokens_used or 0))
 
-    # CASE 1: Antigravity agent -> Create a clean Cascade with the same title + handoff_prompt and archive old one
+    # CASE 1: Antigravity agent -> Keep the EXACT SAME agent & conversation in Antigravity IDE
     if ag.provider.lower() == "antigravity":
-        agy_res = await asyncio.to_thread(
-            AntigravityAdapter.create_cascade,
-            repo_dir,
-            ws_title,
-            handoff_prompt,
-        )
-        if not agy_res.get("ok"):
+        cascade_id = (ag.session_id or "").strip()
+        if not cascade_id and ag.id.startswith("agy-"):
+            short_id = ag.id.replace("agy-", "", 1).strip()
+            brain_root = Path.home() / ".gemini" / "antigravity" / "brain"
+            if short_id and brain_root.exists():
+                matches = [p.name for p in brain_root.glob(f"{short_id}*") if p.is_dir()]
+                if matches:
+                    cascade_id = matches[0]
+                    ag.session_id = cascade_id
+
+        if not cascade_id:
             raise HTTPException(
-                status_code=500,
-                detail=agy_res.get("error") or "Falha ao criar conversa limpa de Handoff no Antigravity.",
+                status_code=400,
+                detail="Sessão Antigravity (session_id) não identificada para este agente.",
             )
 
-        cascade_id = agy_res["cascade_id"]
-        short_id = agy_res["short_id"]
-        new_agent_id = f"agy-{short_id}"
-        repo_path_str = agy_res.get("repo_path") or repo_dir
-        repo_name = agy_res.get("repo_name") or ag.repo_name
-        clean_title = agy_res.get("title") or ws_title
+        # If the existing cascade has a stuck/waiting step, cancel only the active step (never creating a new cascade)
+        if ag.is_stalled or ag.game_state == AgentGameState.POWER_PELLET_WAIT:
+            try:
+                await asyncio.to_thread(AntigravityAdapter.cancel_cascade_invocation, cascade_id)
+                await asyncio.sleep(0.35)
+            except Exception:
+                pass
 
-        # Carry over top-level artifacts (walkthrough.md, implementation_plan.md, *.html) to the new brain folder
-        try:
-            brain_root = Path.home() / ".gemini" / "antigravity" / "brain"
-            old_conv_dir = brain_root / (ag.session_id or "")
-            if not old_conv_dir.is_dir() and ag.session_id and brain_root.exists():
-                matches = [p for p in brain_root.glob(f"{ag.session_id}*") if p.is_dir()]
-                if matches:
-                    old_conv_dir = matches[0]
-            new_conv_dir = brain_root / cascade_id
-            if old_conv_dir.is_dir() and cascade_id:
-                new_conv_dir.mkdir(parents=True, exist_ok=True)
-                for item in old_conv_dir.iterdir():
-                    if item.is_file() and not item.name.startswith("."):
-                        dst_item = new_conv_dir / item.name
-                        if not dst_item.exists():
-                            shutil.copy2(item, dst_item)
-        except Exception:
-            pass
+        live_res = await asyncio.to_thread(_send_antigravity_command_async, ag, handoff_prompt)
 
-        # Archive the old saturated conversation
-        ag.terminal_tail.append(
-            f"♻️ [SELF-HANDOFF] Conversa arquivada — continuidade transferida para {new_agent_id} (100% Saúde)."
+        hub.record_panel_line(
+            ag.id,
+            f"♻️ [SELF-HANDOFF — MESMO AGENTE ({ag.id})] Contexto renovado sem criar novo agente no Antigravity",
         )
-        hub.archive_agent(ag.id, True)
+        hub.record_panel_line(
+            ag.id,
+            "🛡️ Saúde do Contexto restaurada para 100% | 🧠 Risco de Alucinação zerado (0%)",
+        )
+        hub.record_panel_line(ag.id, f"❯ {handoff_prompt}")
+        if live_res.get("injected"):
+            hub.record_panel_line(
+                ag.id,
+                f"  ⎿  ⚡ Handoff de Continuidade enviado na mesma conversa via {live_res.get('method')}",
+            )
 
-        hub.custom_titles[new_agent_id] = clean_title
+        ag.context_health_pct = 100
+        ag.hallucination_risk_pct = 0
+        ag.health_status = "HEALTHY"
+        ag.context_tokens_used = 1500
+        ag.active_elapsed_sec = 0
+        ag.is_stalled = False
+        ag.health_signals = []
+        ag.pending_permission = None
+        ag.game_state = AgentGameState.CHOMPING
+        ag.score_xp += 500
+        ag.pellets_eaten = min(ag.pellets_total, ag.pellets_eaten + 3)
+        ag.current_action = f"♻️ Continuando no mesmo agente (100% Saúde): {ws_title}"
+        ag.last_thought = "Handoff de Continuidade aplicado na mesma conversa Antigravity sem criar novo agente."
+        ag.active_tool = "thinking"
+        ag.last_active_ts = now_ts
+        ag.updated_at = utc_now_iso()
+
+        hub.self_handoff_overrides[ag.id] = {
+            "ts": now_ts,
+            "baseline_tokens": pre_tokens,
+        }
+        hub.active_panel_commands[ag.id] = now_ts
+        hub.dismissed_perm_mtime[ag.id] = now_ts
         hub._save_workspace_state()
-
-        tail_lines = [
-            f"♻️ [SELF-HANDOFF — CONTEXTO LIMPO] Nova conversa Antigravity ({short_id}) iniciada a partir de {ag.id}",
-            f"🛡️ Saúde do Contexto restaurada para 100% | 🧠 Risco de Alucinação zerado (0%)",
-            f"❯ {handoff_prompt}",
-            "  ⎿  ⚡ Pacote de Handoff enviado via ConnectRPC — agente continuando com contexto limpo!",
-        ]
-
-        new_unit = AgentUnit(
-            id=new_agent_id,
-            name=clean_title,
-            workspace_title=clean_title,
-            provider="antigravity",
-            repo_name=repo_name,
-            repo_path=repo_path_str,
-            branch=ag.branch or "main",
-            game_state=AgentGameState.CHOMPING,
-            score_xp=max(650, ag.score_xp + 500),
-            pellets_eaten=min(30, max(4, ag.pellets_eaten + 3)),
-            pellets_total=30,
-            context_health_pct=100,
-            hallucination_risk_pct=0,
-            health_status="HEALTHY",
-            context_tokens_used=1200,
-            context_tokens_limit=200000,
-            active_elapsed_sec=0,
-            is_stalled=False,
-            health_signals=[],
-            current_action=f"♻️ Continuando após Self-Handoff limpo: {clean_title}",
-            last_thought=f"Conversa renovada via Self-Handoff a partir de {ag.id} com contexto 100% limpo.",
-            active_tool="thinking",
-            artifacts=list(ag.artifacts),
-            terminal_tail=tail_lines,
-            control_mode="sdk",
-            session_id=cascade_id,
-            host_app=ag.host_app or "Antigravity",
-            last_active_ts=now_ts,
-            neon_color=ag.neon_color or "#0078D9",
-            sprite_type=ag.sprite_type or "pac_neon",
-        )
-        hub.agents[new_agent_id] = new_unit
-        hub.active_panel_commands[new_agent_id] = now_ts
-        hub.self_handoff_overrides[new_agent_id] = now_ts
-        hub.recent_panel_lines.setdefault(new_agent_id, []).append((now_ts, f"❯ {handoff_prompt}"))
 
         fruit = ContextFruit(
             fruit_type="self_handoff_clean",
-            title=f"♻️ Self-Handoff: {clean_title}",
+            title=f"♻️ Self-Handoff (Mesmo Agente): {ws_title}",
             source_agent_id=ag.id,
             source_agent_name=ag.name,
             source_repo=ag.repo_name,
-            target_agent_id=new_agent_id,
-            target_repo=repo_name,
+            target_agent_id=ag.id,
+            target_repo=ag.repo_name,
             content=handoff_prompt,
         )
         hub.warp_fruits.insert(0, fruit)
 
-        await asyncio.to_thread(_focus_antigravity_app, repo_path_str)
         await hub.broadcast()
         return {
             "ok": True,
             "mode": mode,
             "provider": "antigravity",
+            "kept_same_agent": True,
             "old_agent_id": ag.id,
-            "new_agent_id": new_agent_id,
-            "agent": new_unit.model_dump(),
+            "new_agent_id": ag.id,
+            "live_terminal": live_res,
+            "agent": ag.model_dump(),
             "handoff_prompt": handoff_prompt,
             "fruit": fruit.model_dump(),
             "state": hub.snapshot(),
@@ -3751,8 +4113,12 @@ async def self_handoff_agent(agent_id: str, req: Optional[SelfHandoffRequest] = 
 
     ag.last_active_ts = now_ts
     ag.updated_at = utc_now_iso()
-    hub.self_handoff_overrides[ag.id] = now_ts
+    hub.self_handoff_overrides[ag.id] = {
+        "ts": now_ts,
+        "baseline_tokens": pre_tokens,
+    }
     hub.active_panel_commands[ag.id] = now_ts
+    hub._save_workspace_state()
 
     fruit = ContextFruit(
         fruit_type="self_handoff_clean",
@@ -3771,6 +4137,7 @@ async def self_handoff_agent(agent_id: str, req: Optional[SelfHandoffRequest] = 
         "ok": True,
         "mode": mode,
         "provider": ag.provider,
+        "kept_same_agent": True,
         "old_agent_id": ag.id,
         "new_agent_id": ag.id,
         "live_terminal": live_res,
@@ -4289,7 +4656,7 @@ async def spawn_new_agent(req: SpawnAgentRequest) -> dict:
 
 @app.post("/api/hooks/request-permission")
 async def hook_request_permission(payload: HookPermissionPayload) -> dict:
-    """Long-polling endpoint called by pac_neon_hook.py from any external terminal."""
+    """Non-blocking legacy hook endpoint: never blocks or denies external terminal agents."""
     agent_id = payload.agent_id or f"{payload.provider}-hook"
     repo_name = Path(payload.repo_path).name or "external-repo"
     adapter = AdapterRegistry.get(payload.provider)
@@ -4308,38 +4675,11 @@ async def hook_request_permission(payload: HookPermissionPayload) -> dict:
         )
 
     ag = hub.agents[agent_id]
-    perm = PermissionRequestItem(
-        agent_id=ag.id,
-        agent_name=ag.name,
-        provider=ag.provider,
-        repo_name=repo_name,
-        tool_name=payload.tool_name,
-        command_preview=payload.command_preview,
-        reason=payload.reason or "Aprovação remota interceptada via Hook.",
-        channel="hook",
-    )
-    ag.pending_permission = perm
-    ag.game_state = AgentGameState.POWER_PELLET_WAIT
-    ag.current_action = f"AGUARDANDO PERMISSÃO (HOOK): {payload.command_preview}"
-    ag.terminal_tail.append(f"🚨 [HOOK INTERCEPT] {payload.tool_name}: {payload.command_preview}")
+    ag.game_state = AgentGameState.CHOMPING
+    ag.current_action = f"Executando {payload.tool_name}: {payload.command_preview}"
     ag.updated_at = utc_now_iso()
-
-    ev = threading.Event()
-    hub.hook_events[perm.id] = ev
     await hub.broadcast()
-
-    # Show macOS Notification when an agent blocks on a hook (without stealing focus via webbrowser.open!)
-    trigger_cockpit_popup(
-        reason_title=f"PAC-NEON // {ag.name} pede Permissão",
-        reason_body=f"{payload.tool_name}: {payload.command_preview}",
-        open_browser=False,
-    )
-
-    signaled = await asyncio.to_thread(ev.wait, float(payload.timeout_seconds))
-    hub.hook_events.pop(perm.id, None)
-    if signaled:
-        return hub.hook_results.pop(perm.id, {"decision": "allow"})
-    return {"decision": "deny", "message": "Timeout aguardando resposta no Pac-Neon."}
+    return {"ok": True, "decision": "allow"}
 
 
 @app.post("/api/bridge/heartbeat")
@@ -4427,6 +4767,7 @@ async def hook_agent_event(data: dict) -> dict:
     notif_type = str(data.get("notification_type") or "").strip()
     message = str(data.get("message") or "").strip()
 
+    now = time.time()
     target_ag: Optional[AgentUnit] = None
     if session_id:
         candidate_id = f"claude-{session_id[:8]}"
@@ -4436,7 +4777,65 @@ async def hook_agent_event(data: dict) -> dict:
                 if ag.session_id == session_id or ag.id.endswith(session_id[:8]):
                     target_ag = ag
                     break
-    if not target_ag and cwd:
+        if not target_ag and event_name != "SessionEnd":
+            # Brand-new Claude session just opened in any terminal/IDE (e.g., IntelliJ Terminal, iTerm, VS Code, etc.):
+            # register it immediately in hub.agents so it appears in real time without waiting for polling!
+            active_info = ClaudeAdapter._load_active_claude_sessions().get(session_id) or {}
+            eff_cwd = str(cwd or active_info.get("cwd") or Path.home())
+            repo_name = Path(eff_cwd).name or "claude-workspace"
+            branch = ClaudeAdapter._resolve_git_branch(eff_cwd)
+            host_app = active_info.get("host_app")
+            tty_name = active_info.get("tty")
+            pid_val = active_info.get("pid")
+            env_label = f"{host_app} ({tty_name})" if (host_app and tty_name) else (host_app or tty_name or "Terminal")
+            ws_title = f"{repo_name} ({session_id[:6]})"
+            if candidate_id in hub.custom_titles:
+                ws_title = hub.custom_titles[candidate_id]
+            target_ag = AgentUnit(
+                id=candidate_id,
+                name=ws_title,
+                workspace_title=ws_title,
+                provider="claude",
+                model="Claude Code",
+                sprite_type="ghost_red",
+                neon_color="#FF9E64",
+                repo_name=repo_name,
+                repo_path=eff_cwd,
+                branch=branch,
+                game_state=AgentGameState.IDLE,
+                current_action=f"Sessão Claude aberta em {env_label} — aguardando comando",
+                last_thought=f"Processo Claude Code ativo (PID {pid_val or '?'}) em {eff_cwd}.",
+                active_tool=None,
+                score_xp=150,
+                pellets_eaten=1,
+                session_id=session_id,
+                pid=pid_val,
+                tty=tty_name,
+                host_app=host_app,
+                is_live_discovered=True,
+                archived=False,
+                last_active_ts=now,
+                terminal_tail=[
+                    f"🟢 [SESSÃO ATIVA] Claude Code conectado em {env_label}",
+                    f"📂 Workspace: {eff_cwd} (branch: {branch})",
+                    "❯ Aguardando comando...",
+                ],
+            )
+            target_ag.neon_meta = hub.neon_cli.enrich_agent_metadata(
+                target_ag.repo_path,
+                target_ag.repo_name,
+                target_ag.branch,
+                target_ag.workspace_title,
+                current_action=target_ag.current_action,
+                last_thought=target_ag.last_thought,
+                terminal_tail=target_ag.terminal_tail,
+                provider=target_ag.provider,
+                session_id=target_ag.session_id,
+            )
+            hub.archived_overrides[candidate_id] = False
+            hub.archived_at_ts.pop(candidate_id, None)
+            hub.agents[candidate_id] = target_ag
+    elif cwd:
         for ag in hub.agents.values():
             if ag.repo_path == cwd and not ag.archived:
                 target_ag = ag
@@ -4445,8 +4844,17 @@ async def hook_agent_event(data: dict) -> dict:
     if not target_ag:
         return {"ok": True, "matched": False, "event": event_name}
 
-    now = time.time()
     target_ag.last_active_ts = now
+    if cwd and (not target_ag.repo_path or target_ag.repo_path == str(Path.home())):
+        target_ag.repo_path = cwd
+        target_ag.repo_name = Path(cwd).name or target_ag.repo_name
+
+    # If a previously archived session starts or receives activity in any terminal/IDE, unarchive it immediately
+    if target_ag.archived and event_name not in ("SessionEnd", "Stop", "SubagentStop"):
+        target_ag.archived = False
+        target_ag.archived_at = None
+        hub.archived_overrides[target_ag.id] = False
+        hub.archived_at_ts.pop(target_ag.id, None)
 
     def _release_stale_hook_if_terminal_resolved() -> None:
         stale_perm_id = hub.agent_hook_events.pop(target_ag.id, None)
@@ -4456,7 +4864,19 @@ async def hook_agent_event(data: dict) -> dict:
                 hub.hook_results[stale_perm_id] = {"resolved_in_terminal": True}
                 ev_stale.set()
 
-    if event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "SessionStart"):
+    if event_name == "SessionStart":
+        _release_stale_hook_if_terminal_resolved()
+        target_ag.game_state = AgentGameState.IDLE
+        target_ag.pending_permission = None
+        env_label = f"{target_ag.host_app} ({target_ag.tty})" if (target_ag.host_app and target_ag.tty) else (target_ag.host_app or target_ag.tty or "Terminal")
+        target_ag.current_action = f"Sessão Claude aberta em {env_label} — aguardando comando"
+        hub.hook_state_overrides[target_ag.id] = {
+            "ts": now,
+            "game_state": AgentGameState.IDLE,
+            "current_action": target_ag.current_action,
+            "pending_permission": None,
+        }
+    elif event_name in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
         if event_name in ("UserPromptSubmit", "PostToolUse"):
             _release_stale_hook_if_terminal_resolved()
         target_ag.game_state = AgentGameState.CHOMPING
@@ -4558,6 +4978,9 @@ async def hook_agent_event(data: dict) -> dict:
         if isinstance(suggestions, list) and suggestions:
             hub.hook_suggestions[perm_id] = suggestions
 
+        # Clear any stale dismissal timestamp so this new permission stays visible
+        hub.dismissed_perm_mtime.pop(target_ag.id, None)
+
         target_ag.game_state = AgentGameState.POWER_PELLET_WAIT
         target_ag.pending_permission = perm
         target_ag.current_action = f"Aguardando sua permissão: {tool_name or 'Terminal'} — {cmd_preview}"
@@ -4573,52 +4996,58 @@ async def hook_agent_event(data: dict) -> dict:
             open_browser=False,
         )
 
-        # If this is a synchronous PermissionRequest hook from Claude Code, wait for the user's click in Pac-Neon
-        # and return `hookSpecificOutput` JSON so Claude Code executes the decision natively!
-        if event_name == "PermissionRequest":
+        # For Claude Code native PermissionRequest hooks on interactive sessions (not subagents):
+        # Claude Code displays its terminal prompt first (`q.pushToQueue`) and runs this hook in parallel (`jm9`).
+        # Waiting here and returning `hookSpecificOutput` resolves the permission in background with zero window focus change!
+        if event_name == "PermissionRequest" and not data.get("agent_id"):
             _release_stale_hook_if_terminal_resolved()
             ev = threading.Event()
             hub.hook_events[perm_id] = ev
             hub.agent_hook_events[target_ag.id] = perm_id
+            hub.hook_results.pop(perm_id, None)
             await hub.broadcast()
 
-            signaled = await asyncio.to_thread(ev.wait, 580.0)
+            deadline = time.time() + 295.0
+            while not ev.is_set() and time.time() < deadline:
+                if target_ag.pending_permission is None and perm_id not in hub.hook_results:
+                    break
+                await asyncio.sleep(0.2)
+
             hub.hook_events.pop(perm_id, None)
             if hub.agent_hook_events.get(target_ag.id) == perm_id:
                 hub.agent_hook_events.pop(target_ag.id, None)
+            res_payload = hub.hook_results.pop(perm_id, None)
 
-            if not signaled:
-                return {}
-            res = hub.hook_results.pop(perm_id, None) or {"decision": "allow", "action": "allow"}
-            if res.get("resolved_in_terminal"):
-                return {}
-
-            if res.get("decision") == "deny":
+            if isinstance(res_payload, dict) and res_payload.get("decision") in ("allow", "deny"):
+                act_str = str(res_payload.get("action") or "").upper()
+                custom_txt = str(res_payload.get("custom_text") or "").strip()
+                if res_payload["decision"] == "deny" or (custom_txt and tool_name != "AskUserQuestion"):
+                    msg_reason = (
+                        f"Instrução do usuário no painel Pac-Neon: {custom_txt}"
+                        if custom_txt
+                        else "Permissão negada pelo usuário no painel Pac-Neon."
+                    )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {
+                                "behavior": "deny",
+                                "message": msg_reason,
+                            },
+                        }
+                    }
+                decision_obj: Dict[str, Any] = {"behavior": "allow"}
+                if act_str == PermissionResolutionAction.ALWAYS.value:
+                    saved_sugg = hub.hook_suggestions.pop(perm_id, None)
+                    if isinstance(saved_sugg, list) and saved_sugg:
+                        decision_obj["updatedPermissions"] = saved_sugg
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PermissionRequest",
-                        "decision": {
-                            "behavior": "deny",
-                            "message": str(
-                                res.get("custom_text")
-                                or "Permissão negada pelo usuário no painel Pac-Neon."
-                            ),
-                            "interrupt": False,
-                        },
+                        "decision": decision_obj,
                     }
                 }
-
-            decision_obj: Dict[str, Any] = {"behavior": "allow"}
-            if res.get("action") == "always":
-                suggs = hub.hook_suggestions.pop(perm_id, None)
-                if suggs:
-                    decision_obj["updatedPermissions"] = suggs
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PermissionRequest",
-                    "decision": decision_obj,
-                }
-            }
+            return {"ok": True, "matched": True, "agent_id": target_ag.id, "state": target_ag.game_state.value}
 
     elif event_name in ("Stop", "SubagentStop", "SessionEnd") or (
         event_name == "Notification" and notif_type == "idle_prompt"
@@ -4626,7 +5055,12 @@ async def hook_agent_event(data: dict) -> dict:
         _release_stale_hook_if_terminal_resolved()
         target_ag.game_state = AgentGameState.IDLE
         target_ag.pending_permission = None
-        target_ag.current_action = "Parado — turno finalizado (aguardando próximo comando)"
+        if event_name == "SessionEnd":
+            target_ag.pid = None
+            target_ag.tty = None
+            target_ag.current_action = "Sessão finalizada no terminal."
+        else:
+            target_ag.current_action = "Parado — turno finalizado (aguardando próximo comando)"
         hub.hook_state_overrides[target_ag.id] = {
             "ts": now,
             "game_state": AgentGameState.IDLE,

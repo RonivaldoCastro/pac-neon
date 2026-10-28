@@ -46,6 +46,10 @@ PLIST_LABEL = "com.neon.pac-neon"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{PLIST_LABEL}.plist"
 
 
+def _get_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{PLIST_LABEL}.plist"
+
+
 def ensure_daemon_and_open(open_browser: bool = True) -> int:
     """Starts the Pac-Neon server as a standalone OS background service if not running, and opens the browser."""
     if _is_server_alive():
@@ -54,9 +58,10 @@ def ensure_daemon_and_open(open_browser: bool = True) -> int:
             webbrowser.open(PAC_NEON_URL, new=0, autoraise=True)
         return 0
 
+    plist_path = _get_plist_path()
     # If macOS LaunchAgent is installed, start via launchctl first
-    if sys.platform == "darwin" and PLIST_PATH.exists():
-        subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], capture_output=True)
+    if sys.platform == "darwin" and plist_path.exists():
+        subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True)
         subprocess.run(["launchctl", "start", PLIST_LABEL], capture_output=True)
         for _ in range(15):
             time.sleep(0.15)
@@ -99,8 +104,9 @@ def ensure_daemon_and_open(open_browser: bool = True) -> int:
 
 def stop_daemon() -> int:
     """Stops the standalone Pac-Neon background service."""
-    if sys.platform == "darwin" and PLIST_PATH.exists():
-        subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
+    plist_path = _get_plist_path()
+    if sys.platform == "darwin" and plist_path.exists():
+        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
     try:
         res = subprocess.run(["lsof", "-ti", "tcp:8765"], capture_output=True, text=True, timeout=2.0)
         for line in res.stdout.splitlines():
@@ -116,8 +122,9 @@ def restart_daemon(open_browser: bool = False) -> int:
     """Restarts the standalone Pac-Neon background service."""
     stop_daemon()
     time.sleep(0.4)
-    if sys.platform == "darwin" and PLIST_PATH.exists():
-        subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], capture_output=True)
+    plist_path = _get_plist_path()
+    if sys.platform == "darwin" and plist_path.exists():
+        subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True)
     return ensure_daemon_and_open(open_browser=open_browser)
 
 
@@ -177,7 +184,11 @@ def _install_global_cli_bins() -> None:
 export PYTHONPATH="{PROJECT_ROOT}"
 exec "{sys.executable}" -m pac_neon.cli "$@"
 """
-    for bin_dir in [Path.home() / ".local" / "bin", Path("/opt/homebrew/bin")]:
+    candidate_dirs = [Path.home() / ".local" / "bin"]
+    real_home = Path(os.path.expanduser("~"))
+    if Path.home() == real_home:
+        candidate_dirs.append(Path("/opt/homebrew/bin"))
+    for bin_dir in candidate_dirs:
         try:
             bin_dir.mkdir(parents=True, exist_ok=True)
             target = bin_dir / "pac-neon"
@@ -189,33 +200,14 @@ exec "{sys.executable}" -m pac_neon.cli "$@"
 
 
 def install_auto_triggers(install_launch_agent: bool = True, open_browser: bool = False) -> int:
-    """Installs standalone macOS LaunchAgent, native Pac-Neon.app, global `pac-neon` CLI, and Claude hooks."""
-    hook_cmd = f"python3 {HOOK_SCRIPT}"
-
-    # 1. Configure ~/.claude/settings.json (PreToolUse hook)
-    claude_settings_path = Path.home() / ".claude" / "settings.json"
+    """Installs standalone macOS LaunchAgent, native Pac-Neon.app, global `pac-neon` CLI, and non-blocking Claude hooks."""
+    # 1. Configure ~/.claude/settings.json with non-blocking telemetry hooks (notify.sh)
     try:
-        claude_settings_path.parent.mkdir(parents=True, exist_ok=True)
-        if claude_settings_path.exists():
-            data = json.loads(claude_settings_path.read_text(encoding="utf-8"))
-        else:
-            data = {}
-        hooks = data.setdefault("hooks", {})
-        pre_tool = hooks.setdefault("PreToolUse", [])
-        already_installed = any(
-            "pac_neon_hook.py" in json.dumps(entry) for entry in pre_tool
-        )
-        if not already_installed:
-            pre_tool.append(
-                {
-                    "matcher": "Bash|Write|Edit|MultiEdit",
-                    "hooks": [{"type": "command", "command": hook_cmd}],
-                }
-            )
-            claude_settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            print(f"✅ Trigger automático instalado no Claude Code: {claude_settings_path}")
+        from .neon_cli_bridge import install_pac_neon_agent_hooks
+        install_pac_neon_agent_hooks()
+        print("✅ Hooks não-bloqueantes sincronizados no Claude Code (~/.claude/settings.json)")
     except Exception as exc:
-        print(f"⚠️ Não foi possível atualizar {claude_settings_path}: {exc}")
+        print(f"⚠️ Não foi possível atualizar hooks do Claude Code: {exc}")
 
     # 2. Install global `pac-neon` executable + ~/.zshrc alias
     _install_global_cli_bins()
@@ -239,8 +231,9 @@ def install_auto_triggers(install_launch_agent: bool = True, open_browser: bool 
             print(f"⚠️ Erro ao criar {app_target}: {exc}")
 
     # 4. Install macOS LaunchAgent so Pac-Neon runs standalone in the OS background (NEVER allocating an AI agent)
+    plist_path = _get_plist_path()
     if install_launch_agent and sys.platform == "darwin":
-        plist_dir = PLIST_PATH.parent
+        plist_dir = plist_path.parent
         plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -278,10 +271,10 @@ def install_auto_triggers(install_launch_agent: bool = True, open_browser: bool 
 """
         try:
             plist_dir.mkdir(parents=True, exist_ok=True)
-            PLIST_PATH.write_text(plist_content, encoding="utf-8")
-            subprocess.run(["launchctl", "unload", str(PLIST_PATH)], capture_output=True)
-            subprocess.run(["launchctl", "load", "-w", str(PLIST_PATH)], capture_output=True)
-            print(f"✅ Serviço nativo macOS (LaunchAgent) ativo: {PLIST_PATH}")
+            plist_path.write_text(plist_content, encoding="utf-8")
+            subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+            subprocess.run(["launchctl", "load", "-w", str(plist_path)], capture_output=True)
+            print(f"✅ Serviço nativo macOS (LaunchAgent) ativo: {plist_path}")
         except Exception as exc:
             print(f"⚠️ Erro ao registrar LaunchAgent: {exc}")
 
@@ -425,10 +418,11 @@ def uninstall_pac_neon() -> int:
     import shutil
 
     stop_daemon()
-    if PLIST_PATH.exists():
+    plist_path = _get_plist_path()
+    if plist_path.exists():
         try:
-            PLIST_PATH.unlink()
-            print(f"🗑️ LaunchAgent removido: {PLIST_PATH}")
+            plist_path.unlink()
+            print(f"🗑️ LaunchAgent removido: {plist_path}")
         except Exception:
             pass
     app_bundle = Path.home() / "Applications" / "Pac-Neon.app"
@@ -438,7 +432,11 @@ def uninstall_pac_neon() -> int:
             print(f"🗑️ Aplicativo removido: {app_bundle}")
         except Exception:
             pass
-    for bin_dir in [Path.home() / ".local" / "bin", Path("/opt/homebrew/bin")]:
+    candidate_dirs = [Path.home() / ".local" / "bin"]
+    real_home = Path(os.path.expanduser("~"))
+    if Path.home() == real_home:
+        candidate_dirs.append(Path("/opt/homebrew/bin"))
+    for bin_dir in candidate_dirs:
         target = bin_dir / "pac-neon"
         if target.exists():
             try:
